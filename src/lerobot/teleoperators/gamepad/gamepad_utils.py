@@ -246,18 +246,16 @@ class GamepadController(InputController):
             if event.type == pygame.JOYBUTTONDOWN:
                 if event.button == 3:
                     self.episode_end_status = TeleopEvents.SUCCESS
-                # A button (1) for failure
-                elif event.button == 1:
-                    self.episode_end_status = TeleopEvents.FAILURE
-                # X button (0) for rerecord
+                # A/Cross button for failure
                 elif event.button == 0:
+                    self.episode_end_status = TeleopEvents.FAILURE
+                # X/Square button for rerecord
+                elif event.button == 2:
                     self.episode_end_status = TeleopEvents.RERECORD_EPISODE
 
-                # RB button (6) for closing gripper
+                # Fallback for controllers that expose gripper triggers as buttons.
                 elif event.button == 6:
                     self.close_gripper_command = True
-
-                # LT button (7) for opening gripper
                 elif event.button == 7:
                     self.open_gripper_command = True
 
@@ -271,6 +269,13 @@ class GamepadController(InputController):
 
                 elif event.button == 7:
                     self.open_gripper_command = False
+
+            elif event.type == pygame.JOYAXISMOTION:
+                # Common Linux pygame mapping: LT is axis 2, RT is axis 5, resting at -1 and pressed at +1.
+                if event.axis == 5:
+                    self.open_gripper_command = event.value > 0.5
+                elif event.axis == 2:
+                    self.close_gripper_command = event.value > 0.5
 
             # Check for RB button (typically button 5) for intervention flag
             if self.joystick.get_button(5):

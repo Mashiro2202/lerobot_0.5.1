@@ -1,0 +1,29 @@
+{
+  "_name_or_path": "/home/ubuntu/vla/rl/models--helper2424--resnet10/snapshots/c587b31f2f79e653249ed4af78f0ba7dff72122c",
+  "architectures": [
+    "ResNet10"
+  ],
+  "auto_map": {
+    "AutoConfig": "helper2424/resnet10--configuration_resnet.ResNet10Config",
+    "AutoModel": "modeling_resnet.ResNet10"
+  },
+  "depths": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "embedding_size": 64,
+  "hidden_act": "relu",
+  "hidden_sizes": [
+    64,
+    128,
+    256,
+    512
+  ],
+  "model_type": "resnet10",
+  "num_channels": 3,
+  "pooler": "avg",
+  "torch_dtype": "float32",
+  "transformers_version": "4.48.0"
+}

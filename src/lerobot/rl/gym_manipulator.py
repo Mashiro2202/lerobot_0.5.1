@@ -127,6 +127,8 @@ class RobotEnv(gym.Env):
         robot,
         use_gripper: bool = False,
         display_cameras: bool = False,
+        display_crop_params_dict: dict[str, tuple[int, int, int, int]] | None = None,
+        display_resize_size: tuple[int, int] | None = None,
         reset_pose: list[float] | None = None,
         reset_time_s: float = 5.0,
     ) -> None:
@@ -143,6 +145,8 @@ class RobotEnv(gym.Env):
 
         self.robot = robot
         self.display_cameras = display_cameras
+        self.display_crop_params_dict = display_crop_params_dict or {}
+        self.display_resize_size = display_resize_size
 
         # Connect to the robot if not already connected.
         if not self.robot.is_connected:
@@ -279,16 +283,71 @@ class RobotEnv(gym.Env):
         )
 
     def render(self) -> None:
-        """Display robot camera feeds."""
+        """Display robot camera feeds after optional ROI crop and resize."""
         import cv2
 
         current_observation = self._get_observation()
-        if current_observation is not None:
-            image_keys = [key for key in current_observation if "image" in key]
+        if current_observation is None:
+            return
 
-            for key in image_keys:
-                cv2.imshow(key, cv2.cvtColor(current_observation[key].numpy(), cv2.COLOR_RGB2BGR))
-                cv2.waitKey(1)
+        images = current_observation.get("pixels", {})
+        display_images = []
+        for key, image in images.items():
+            if hasattr(image, "numpy"):
+                image = image.numpy()
+            image = self._prepare_display_image(key, image)
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            cv2.putText(
+                image,
+                key,
+                (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                image,
+                key,
+                (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+            display_images.append(image)
+
+        if not display_images:
+            return
+
+        min_height = min(image.shape[0] for image in display_images)
+        normalized_images = [
+            cv2.resize(image, (round(image.shape[1] * min_height / image.shape[0]), min_height))
+            if image.shape[0] != min_height
+            else image
+            for image in display_images
+        ]
+        combined_image = cv2.hconcat(normalized_images)
+        cv2.imshow("roi_cameras", combined_image)
+        cv2.waitKey(1)
+
+    def _prepare_display_image(self, key: str, image: np.ndarray) -> np.ndarray:
+        import cv2
+
+        crop_params = self.display_crop_params_dict.get(
+            f"{OBS_IMAGES}.{key}", self.display_crop_params_dict.get(key)
+        )
+        if crop_params is not None:
+            top, left, height, width = crop_params
+            image = image[top : top + height, left : left + width]
+
+        if self.display_resize_size is not None:
+            height, width = self.display_resize_size
+            image = cv2.resize(image, (width, height))
+
+        return image
 
     def close(self) -> None:
         """Close environment and disconnect robot."""
@@ -341,12 +400,24 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     display_cameras = (
         cfg.processor.observation.display_cameras if cfg.processor.observation is not None else False
     )
+    display_crop_params_dict = (
+        cfg.processor.image_preprocessing.crop_params_dict
+        if cfg.processor.image_preprocessing is not None
+        else None
+    )
+    display_resize_size = (
+        cfg.processor.image_preprocessing.resize_size
+        if cfg.processor.image_preprocessing is not None
+        else None
+    )
     reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
 
     env = RobotEnv(
         robot=robot,
         use_gripper=use_gripper,
         display_cameras=display_cameras,
+        display_crop_params_dict=display_crop_params_dict,
+        display_resize_size=display_resize_size,
         reset_pose=reset_pose,
     )
 
@@ -665,7 +736,7 @@ def control_loop(
         # Create a neutral action (no movement)
         neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
         if use_gripper:
-            neutral_action = torch.cat([neutral_action, torch.tensor([0.0])])  # Gripper stay
+            neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
 
         # Use the new step function
         transition = step_env_and_process_transition(

@@ -117,17 +117,95 @@ def select_rect_roi(img):
     return roi
 
 
+def clamp_square_roi(anchor_x: int, anchor_y: int, current_x: int, current_y: int, image_shape):
+    """Return a square ROI (top, left, height, width) clamped inside the image."""
+    image_h, image_w = image_shape[:2]
+    dx = current_x - anchor_x
+    dy = current_y - anchor_y
+    side = max(abs(dx), abs(dy), 1)
+
+    left = anchor_x if dx >= 0 else anchor_x - side
+    top = anchor_y if dy >= 0 else anchor_y - side
+
+    left = max(min(left, image_w - side), 0)
+    top = max(min(top, image_h - side), 0)
+    side = min(side, image_w - left, image_h - top)
+    return int(top), int(left), int(side), int(side)
+
+
+def select_square_roi(img):
+    """
+    Allows the user to draw a square ROI on the image.
+
+    The user clicks and drags as usual, but the selected area is constrained to
+    a square and clamped inside the image. Returns (top, left, height, width).
+    """
+    clone = img.copy()
+    working_img = clone.copy()
+
+    roi = None
+    drawing = False
+    anchor_x, anchor_y = -1, -1
+
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal anchor_x, anchor_y, drawing, roi, working_img
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            drawing = True
+            anchor_x, anchor_y = x, y
+
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if drawing:
+                top, left, height, width = clamp_square_roi(anchor_x, anchor_y, x, y, clone.shape)
+                temp = working_img.copy()
+                cv2.rectangle(temp, (left, top), (left + width, top + height), (0, 255, 0), 2)
+                cv2.imshow("Select ROI", temp)
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            drawing = False
+            roi = clamp_square_roi(anchor_x, anchor_y, x, y, clone.shape)
+            top, left, height, width = roi
+            working_img = clone.copy()
+            cv2.rectangle(working_img, (left, top), (left + width, top + height), (0, 255, 0), 2)
+            cv2.imshow("Select ROI", working_img)
+
+    cv2.namedWindow("Select ROI")
+    cv2.setMouseCallback("Select ROI", mouse_callback)
+    cv2.imshow("Select ROI", working_img)
+
+    print("Instructions for square ROI selection:")
+    print("  - Click and drag to draw a square ROI.")
+    print("  - Press 'c' to confirm the selection.")
+    print("  - Press 'r' to reset and draw again.")
+    print("  - Press ESC to cancel the selection.")
+
+    while True:
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("c") and roi is not None:
+            break
+        elif key == ord("r"):
+            working_img = clone.copy()
+            roi = None
+            cv2.imshow("Select ROI", working_img)
+        elif key == 27:
+            roi = None
+            break
+
+    cv2.destroyWindow("Select ROI")
+    return roi
+
+
 def select_square_roi_for_images(images: dict) -> dict:
     """
     For each image in the provided dictionary, open a window to allow the user
-    to select a rectangular ROI. Returns a dictionary mapping each key to a tuple
+    to select a square ROI. Returns a dictionary mapping each key to a tuple
     (top, left, height, width) representing the ROI.
 
     Parameters:
         images (dict): Dictionary where keys are identifiers and values are OpenCV images.
 
     Returns:
-        dict: Mapping of image keys to the selected rectangular ROI.
+        dict: Mapping of image keys to the selected square ROI.
     """
     selected_rois = {}
 
@@ -136,8 +214,8 @@ def select_square_roi_for_images(images: dict) -> dict:
             print(f"Image for key '{key}' is None, skipping.")
             continue
 
-        print(f"\nSelect rectangular ROI for image with key: '{key}'")
-        roi = select_rect_roi(img)
+        print(f"\nSelect square ROI for image with key: '{key}'")
+        roi = select_square_roi(img)
 
         if roi is None:
             print(f"No valid ROI selected for '{key}'.")
@@ -281,6 +359,11 @@ if __name__ == "__main__":
         default=None,
         help="The repository id for the new cropped and resized dataset. If not provided, it defaults to `repo_id` + '_cropped_resized'.",
     )
+    parser.add_argument(
+        "--print-only",
+        action="store_true",
+        help="Only display ROI selection UI and print crop_params_dict. Do not create a cropped dataset.",
+    )
     args = parser.parse_args()
 
     dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
@@ -295,10 +378,36 @@ if __name__ == "__main__":
         with open(args.crop_params_path) as f:
             rois = json.load(f)
 
-    # Print the selected rectangular ROIs
-    print("\nSelected Rectangular Regions of Interest (top, left, height, width):")
+    rois = {key: list(roi) for key, roi in rois.items()}
+
+    # Print the selected square ROIs
+    print("\nSelected Square Regions of Interest (top, left, height, width):")
     for key, roi in rois.items():
         print(f"{key}: {roi}")
+
+    print("\ncrop_params_dict:")
+    print(json.dumps(rois, indent=4))
+
+    print("\nConfig snippet:")
+    print(
+        json.dumps(
+            {
+                "env": {
+                    "processor": {
+                        "image_preprocessing": {
+                            "crop_params_dict": rois,
+                            "resize_size": [128, 128],
+                        }
+                    }
+                }
+            },
+            indent=4,
+        )
+    )
+
+    if args.print_only:
+        print("\n--print-only enabled: skipped cropped dataset creation.")
+        raise SystemExit(0)
 
     new_repo_id = args.new_repo_id if args.new_repo_id else args.repo_id + "_cropped_resized"
 

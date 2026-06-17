@@ -16,10 +16,20 @@
 
 import logging
 import os
+import select
 import sys
+import threading
 import time
+import atexit
 from queue import Queue
 from typing import Any
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
 
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
@@ -62,8 +72,13 @@ class KeyboardTeleop(Teleoperator):
         self.robot_type = config.type
 
         self.event_queue = Queue()
+        self.key_expiry = {}
         self.current_pressed = {}
         self.listener = None
+        self.terminal_thread = None
+        self.terminal_stop_event = None
+        self.terminal_fd = None
+        self.terminal_old_settings = None
         self.logs = {}
 
     @property
@@ -80,7 +95,11 @@ class KeyboardTeleop(Teleoperator):
 
     @property
     def is_connected(self) -> bool:
-        return PYNPUT_AVAILABLE and isinstance(self.listener, keyboard.Listener) and self.listener.is_alive()
+        pynput_connected = (
+            PYNPUT_AVAILABLE and isinstance(self.listener, keyboard.Listener) and self.listener.is_alive()
+        )
+        terminal_connected = self.terminal_thread is not None and self.terminal_thread.is_alive()
+        return pynput_connected or terminal_connected
 
     @property
     def is_calibrated(self) -> bool:
@@ -98,25 +117,106 @@ class KeyboardTeleop(Teleoperator):
         else:
             logging.info("pynput not available - skipping local keyboard listener.")
             self.listener = None
+        self._start_terminal_listener()
 
     def calibrate(self) -> None:
         pass
 
     def _on_press(self, key):
-        if hasattr(key, "char"):
-            self.event_queue.put((key.char, True))
+        key_char = getattr(key, "char", None)
+        if key_char is not None:
+            self.event_queue.put((key_char, True))
+        else:
+            self.event_queue.put((key, True))
 
     def _on_release(self, key):
-        if hasattr(key, "char"):
-            self.event_queue.put((key.char, False))
+        key_char = getattr(key, "char", None)
+        if key_char is not None:
+            self.event_queue.put((key_char, False))
+        else:
+            self.event_queue.put((key, False))
+            if key == getattr(keyboard.Key, "ctrl", None):
+                self.event_queue.put((keyboard.Key.ctrl_l, False))
+                self.event_queue.put((keyboard.Key.ctrl_r, False))
+            elif key == getattr(keyboard.Key, "shift", None):
+                self.event_queue.put((getattr(keyboard.Key, "shift_l", keyboard.Key.shift), False))
+                self.event_queue.put((keyboard.Key.shift_r, False))
         if key == keyboard.Key.esc:
             logging.info("ESC pressed, disconnecting.")
             self.disconnect()
 
+    def _start_terminal_listener(self) -> None:
+        if termios is None or tty is None:
+            return
+        if not sys.stdin.isatty():
+            return
+
+        self.terminal_fd = sys.stdin.fileno()
+        self.terminal_old_settings = termios.tcgetattr(self.terminal_fd)
+        tty.setcbreak(self.terminal_fd)
+        atexit.register(self._restore_terminal)
+
+        self.terminal_stop_event = threading.Event()
+        self.terminal_thread = threading.Thread(target=self._terminal_listener_loop, daemon=True)
+        self.terminal_thread.start()
+        logging.info(
+            "Terminal keyboard listener enabled as fallback. Arrow keys control x/y; "
+            "left/right Shift and Ctrl are handled by pynput when available; "
+            "z/x and c/v remain fallback keys for z and gripper."
+        )
+
+    def _terminal_listener_loop(self) -> None:
+        while self.terminal_stop_event is not None and not self.terminal_stop_event.is_set():
+            readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not readable:
+                continue
+            char = sys.stdin.read(1)
+            if char == "\x1b":
+                sequence = char
+                for _ in range(2):
+                    readable, _, _ = select.select([sys.stdin], [], [], 0.01)
+                    if readable:
+                        sequence += sys.stdin.read(1)
+                key = {
+                    "\x1b[A": "up",
+                    "\x1b[B": "down",
+                    "\x1b[C": "right",
+                    "\x1b[D": "left",
+                }.get(sequence)
+                if key is not None:
+                    self.event_queue.put((key, True, time.perf_counter() + 0.2))
+            elif char in {"z", "x", "c", "v"}:
+                key = {
+                    "z": "z_down",
+                    "x": "z_up",
+                    "c": "gripper_close",
+                    "v": "gripper_open",
+                }[char]
+                self.event_queue.put((key, True, time.perf_counter() + 0.2))
+            elif char in {"s", "r", "q"}:
+                self.event_queue.put((char, True, time.perf_counter() + 0.2))
+
+    def _restore_terminal(self) -> None:
+        if self.terminal_fd is not None and self.terminal_old_settings is not None and termios is not None:
+            termios.tcsetattr(self.terminal_fd, termios.TCSADRAIN, self.terminal_old_settings)
+
     def _drain_pressed_keys(self):
         while not self.event_queue.empty():
-            key_char, is_pressed = self.event_queue.get_nowait()
+            event = self.event_queue.get_nowait()
+            if len(event) == 3:
+                key_char, is_pressed, expires_at = event
+                self.key_expiry[key_char] = expires_at
+            else:
+                key_char, is_pressed = event
+                if not is_pressed:
+                    self.key_expiry.pop(key_char, None)
             self.current_pressed[key_char] = is_pressed
+
+        now = time.perf_counter()
+        for key_char, expires_at in list(self.key_expiry.items()):
+            if now >= expires_at:
+                self.current_pressed[key_char] = False
+                del self.key_expiry[key_char]
 
     def configure(self):
         pass
@@ -140,6 +240,15 @@ class KeyboardTeleop(Teleoperator):
     def disconnect(self) -> None:
         if self.listener is not None:
             self.listener.stop()
+        if self.terminal_stop_event is not None:
+            self.terminal_stop_event.set()
+        if self.terminal_thread is not None:
+            self.terminal_thread.join(timeout=0.2)
+        self._restore_terminal()
+        self.terminal_thread = None
+        self.terminal_stop_event = None
+        self.terminal_fd = None
+        self.terminal_old_settings = None
 
 
 class KeyboardEndEffectorTeleop(KeyboardTeleop):
@@ -155,6 +264,21 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         super().__init__(config)
         self.config = config
         self.misc_keys_queue = Queue()
+        self._last_action_log_t = 0.0
+
+    def _matches_key(self, key, pynput_names: str | tuple[str, ...], *terminal_names: str) -> bool:
+        if isinstance(key, str):
+            return key in terminal_names
+        if not PYNPUT_AVAILABLE:
+            return False
+        if isinstance(pynput_names, str):
+            pynput_names = (pynput_names,)
+        return any(key == getattr(keyboard.Key, name, None) for name in pynput_names)
+
+    def _pynput_key(self, name: str):
+        if not PYNPUT_AVAILABLE:
+            return None
+        return getattr(keyboard.Key, name, None)
 
     @property
     def action_features(self) -> dict:
@@ -181,30 +305,30 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
 
         # Generate action based on current key states
         for key, val in self.current_pressed.items():
-            if key == keyboard.Key.up:
-                delta_y = -int(val)
-            elif key == keyboard.Key.down:
-                delta_y = int(val)
-            elif key == keyboard.Key.left:
-                delta_x = int(val)
-            elif key == keyboard.Key.right:
-                delta_x = -int(val)
-            elif key == keyboard.Key.shift:
-                delta_z = -int(val)
-            elif key == keyboard.Key.shift_r:
-                delta_z = int(val)
-            elif key == keyboard.Key.ctrl_r:
+            if not val:
+                continue
+            if self._matches_key(key, "up", "up"):
+                delta_x = 1.0
+            elif self._matches_key(key, "down", "down"):
+                delta_x = -1.0
+            elif self._matches_key(key, "left", "left"):
+                delta_y = 1.0
+            elif self._matches_key(key, "right", "right"):
+                delta_y = -1.0
+            elif self._matches_key(key, ("shift", "shift_l"), "z_down"):
+                delta_z = -1.0
+            elif self._matches_key(key, "shift_r", "z_up"):
+                delta_z = 1.0
+            elif self._matches_key(key, "ctrl_r", "gripper_open"):
                 # Gripper actions are expected to be between 0 (close), 1 (stay), 2 (open)
-                gripper_action = int(val) + 1
-            elif key == keyboard.Key.ctrl_l:
-                gripper_action = int(val) - 1
-            elif val:
+                gripper_action = 2.0
+            elif self._matches_key(key, "ctrl_l", "gripper_close"):
+                gripper_action = 0.0
+            else:
                 # If the key is pressed, add it to the misc_keys_queue
                 # this will record key presses that are not part of the delta_x, delta_y, delta_z
                 # this is useful for retrieving other events like interventions for RL, episode success, etc.
                 self.misc_keys_queue.put(key)
-
-        self.current_pressed.clear()
 
         action_dict = {
             "delta_x": delta_x,
@@ -214,6 +338,13 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
 
         if self.config.use_gripper:
             action_dict["gripper"] = gripper_action
+
+        now = time.perf_counter()
+        if now - self._last_action_log_t > 0.5 and (
+            delta_x != 0.0 or delta_y != 0.0 or delta_z != 0.0 or gripper_action != 1.0
+        ):
+            logging.info(f"Keyboard EE action: {action_dict}")
+            self._last_action_log_t = now
 
         return action_dict
 
@@ -245,16 +376,27 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
 
         # Check if any movement keys are currently pressed (indicates intervention)
         movement_keys = [
-            keyboard.Key.up,
-            keyboard.Key.down,
-            keyboard.Key.left,
-            keyboard.Key.right,
-            keyboard.Key.shift,
-            keyboard.Key.shift_r,
-            keyboard.Key.ctrl_r,
-            keyboard.Key.ctrl_l,
+            self._pynput_key("up"),
+            self._pynput_key("down"),
+            self._pynput_key("left"),
+            self._pynput_key("right"),
+            self._pynput_key("shift"),
+            self._pynput_key("shift_l"),
+            self._pynput_key("shift_r"),
+            self._pynput_key("ctrl_l"),
+            self._pynput_key("ctrl_r"),
+            "up",
+            "down",
+            "left",
+            "right",
+            "z_down",
+            "z_up",
+            "gripper_open",
+            "gripper_close",
         ]
-        is_intervention = any(self.current_pressed.get(key, False) for key in movement_keys)
+        is_intervention = any(
+            self.current_pressed.get(key, False) for key in movement_keys if key is not None
+        )
 
         # Check for episode control commands from misc_keys_queue
         terminate_episode = False

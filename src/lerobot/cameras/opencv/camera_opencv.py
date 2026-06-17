@@ -217,10 +217,42 @@ class OpenCVCamera(Camera):
         else:
             self._validate_width_and_height()
 
+        # Some V4L2 cameras reset FOURCC when width/height are set. Re-apply it
+        # before FPS validation so high-resolution MJPG modes can keep 30 FPS.
+        if self.config.fourcc is not None:
+            self._validate_fourcc()
+
         if self.fps is None:
             self.fps = self.videocapture.get(cv2.CAP_PROP_FPS)
         else:
             self._validate_fps()
+
+    def _get_actual_fourcc(self) -> str:
+        """Returns the current FOURCC string reported by OpenCV."""
+
+        if self.videocapture is None:
+            raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
+
+        actual_fourcc_code = int(self.videocapture.get(cv2.CAP_PROP_FOURCC))
+        return "".join([chr((actual_fourcc_code >> 8 * i) & 0xFF) for i in range(4)])
+
+    def _measure_capture_fps(self, duration_s: float = 1.0) -> float:
+        """Measures camera throughput when OpenCV property readback is unreliable."""
+
+        if self.videocapture is None:
+            raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
+
+        start = time.perf_counter()
+        frames = 0
+        while time.perf_counter() - start < duration_s:
+            success, _ = self.videocapture.read()
+            if success:
+                frames += 1
+
+        elapsed_s = time.perf_counter() - start
+        if elapsed_s <= 0:
+            return 0.0
+        return frames / elapsed_s
 
     def _validate_fps(self) -> None:
         """Validates and sets the camera's frames per second (FPS)."""
@@ -235,7 +267,20 @@ class OpenCVCamera(Camera):
         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
         # Use math.isclose for robust float comparison
         if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
-            raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
+            actual_fourcc = self._get_actual_fourcc()
+            measured_fps = self._measure_capture_fps()
+            if math.isclose(self.fps, measured_fps, rel_tol=0.15):
+                logger.warning(
+                    f"{self} reported fps={actual_fps} after setting fps={self.fps} "
+                    f"(actual_fourcc={actual_fourcc!r}, {success=}), but measured_fps={measured_fps:.2f} "
+                    "matches the requested FPS. Continuing."
+                )
+                return
+
+            raise RuntimeError(
+                f"{self} failed to set fps={self.fps} ({actual_fps=}, measured_fps={measured_fps:.2f}, "
+                f"actual_fourcc={actual_fourcc!r}, {success=})."
+            )
 
     def _validate_fourcc(self) -> None:
         """Validates and sets the camera's FOURCC code."""
@@ -271,15 +316,25 @@ class OpenCVCamera(Camera):
         height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
 
         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        if not width_success or self.capture_width != actual_width:
+        if self.capture_width != actual_width:
             raise RuntimeError(
                 f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
             )
+        if not width_success:
+            logger.warning(
+                f"{self} reported width_success=False, but actual_width={actual_width} matches requested "
+                f"capture_width={self.capture_width}. Continuing."
+            )
 
         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if not height_success or self.capture_height != actual_height:
+        if self.capture_height != actual_height:
             raise RuntimeError(
                 f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+            )
+        if not height_success:
+            logger.warning(
+                f"{self} reported height_success=False, but actual_height={actual_height} matches requested "
+                f"capture_height={self.capture_height}. Continuing."
             )
 
     @staticmethod
