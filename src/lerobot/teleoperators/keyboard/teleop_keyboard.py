@@ -316,9 +316,9 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
             elif self._matches_key(key, "right", "right"):
                 delta_y = -1.0
             elif self._matches_key(key, ("shift", "shift_l"), "z_down"):
-                delta_z = -1.0
-            elif self._matches_key(key, "shift_r", "z_up"):
                 delta_z = 1.0
+            elif self._matches_key(key, "shift_r", "z_up"):
+                delta_z = -1.0
             elif self._matches_key(key, "ctrl_r", "gripper_open"):
                 # Gripper actions are expected to be between 0 (close), 1 (stay), 2 (open)
                 gripper_action = 2.0

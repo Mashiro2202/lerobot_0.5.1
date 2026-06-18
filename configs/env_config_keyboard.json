@@ -44,16 +44,16 @@
             "image_preprocessing": {
                 "crop_params_dict": {
                     "observation.images.top": [
-                        0,
-                        53,
-                        720,
-                        720
+                        116,
+                        503,
+                        311,
+                        311
                     ],
                     "observation.images.wrist": [
-                        122,
-                        522,
-                        350,
-                        350
+                        0,
+                        70,
+                        720,
+                        720
                     ]
                 },
                 "resize_size": [128,128]
@@ -99,7 +99,7 @@
         "repo_id": "record0617/pick_up",
         "root": "/home/ubuntu/.cache/huggingface/lerobot/record0617/pick_up",
         "task": "Pick the object and place it up",
-        "num_episodes_to_record": 3,
+        "num_episodes_to_record": 30,
         "replay_episode": null,
         "push_to_hub": false
     },

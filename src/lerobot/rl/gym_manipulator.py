@@ -244,7 +244,15 @@ class RobotEnv(gym.Env):
             reset_follower_position(self.robot, np.array(self.reset_pose))
             log_say("Reset the environment done.", play_sounds=True)
 
-        precise_sleep(max(self.reset_time_s - (time.perf_counter() - start_time), 0.0))
+        remaining_reset_s = max(self.reset_time_s - (time.perf_counter() - start_time), 0.0)
+        last_reported_reset_s = None
+        while remaining_reset_s > 0:
+            reported_reset_s = int(np.ceil(remaining_reset_s))
+            if reported_reset_s != last_reported_reset_s:
+                print(f"[reset] remaining={reported_reset_s}s", flush=True)
+                last_reported_reset_s = reported_reset_s
+            precise_sleep(min(0.1, remaining_reset_s))
+            remaining_reset_s = max(self.reset_time_s - (time.perf_counter() - start_time), 0.0)
 
         super().reset(seed=seed, options=options)
 
@@ -729,9 +737,28 @@ def control_loop(
     episode_idx = 0
     episode_step = 0
     episode_start_time = time.perf_counter()
+    last_status_second = -1
+    control_time_s = cfg.env.processor.reset.control_time_s if cfg.env.processor.reset is not None else None
 
     while episode_idx < cfg.dataset.num_episodes_to_record:
         step_start_time = time.perf_counter()
+        episode_elapsed_s = time.perf_counter() - episode_start_time
+        status_second = int(episode_elapsed_s)
+        if status_second != last_status_second:
+            if control_time_s is not None:
+                remaining_s = max(control_time_s - episode_elapsed_s, 0.0)
+                print(
+                    f"[recording] episode={episode_idx + 1}/{cfg.dataset.num_episodes_to_record} "
+                    f"remaining={remaining_s:.0f}s frames={episode_step}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[recording] episode={episode_idx + 1}/{cfg.dataset.num_episodes_to_record} "
+                    f"elapsed={episode_elapsed_s:.0f}s frames={episode_step}",
+                    flush=True,
+                )
+            last_status_second = status_second
 
         # Create a neutral action (no movement)
         neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
@@ -800,6 +827,8 @@ def control_loop(
 
             transition = create_transition(observation=obs, info=info)
             transition = env_processor(transition)
+            episode_start_time = time.perf_counter()
+            last_status_second = -1
 
         # Maintain fps timing
         precise_sleep(max(dt - (time.perf_counter() - step_start_time), 0.0))
