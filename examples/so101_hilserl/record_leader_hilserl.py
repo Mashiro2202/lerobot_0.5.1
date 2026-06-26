@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 try:
     import termios
@@ -40,12 +41,14 @@ except ImportError:  # pragma: no cover - POSIX-only interactive helper.
     tty = None
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+from lerobot.configs.types import PipelineFeatureType
 from lerobot.datasets.feature_utils import combine_feature_dicts
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.model.kinematics import RobotKinematics
-from lerobot.processor import make_default_processors
+from lerobot.processor import ObservationProcessorStep, RobotProcessorPipeline, make_default_processors
+from lerobot.processor.converters import observation_to_transition, transition_to_observation
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from lerobot.scripts.lerobot_record import record_loop
 from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
@@ -92,8 +95,49 @@ class KeyReader:
         return sys.stdin.read(1)
 
 
+@dataclass
+class RecordImageCropResizeProcessorStep(ObservationProcessorStep):
+    crop_params_dict: dict[str, tuple[int, int, int, int]] | None = None
+    resize_size: tuple[int, int] | None = None
+
+    def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        if self.resize_size is None and not self.crop_params_dict:
+            return observation
+
+        new_observation = dict(observation)
+        crop_params_dict = self.crop_params_dict or {}
+        for key, value in observation.items():
+            if not isinstance(value, np.ndarray) or value.ndim != 3:
+                continue
+
+            image = value
+            if key in crop_params_dict:
+                top, left, height, width = crop_params_dict[key]
+                image = image[top : top + height, left : left + width]
+
+            if self.resize_size is not None:
+                height, width = self.resize_size
+                image = np.asarray(Image.fromarray(image).resize((width, height), Image.BILINEAR))
+
+            new_observation[key] = image
+        return new_observation
+
+    def transform_features(self, features: dict[PipelineFeatureType, dict]) -> dict[PipelineFeatureType, dict]:
+        if self.resize_size is None:
+            return features
+        height, width = self.resize_size
+        for key, value in list(features[PipelineFeatureType.OBSERVATION].items()):
+            if isinstance(value, tuple) and len(value) == 3:
+                features[PipelineFeatureType.OBSERVATION][key] = (height, width, value[2])
+        return features
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config-path", default=None)
+    config_args, remaining_args = config_parser.parse_known_args()
+
+    parser = argparse.ArgumentParser(parents=[config_parser])
     parser.add_argument("--repo-id", default="ROItest/leader_hilserl_record")
     parser.add_argument("--task", default="leader arm HIL-SERL recording")
     parser.add_argument("--root", default=None)
@@ -128,7 +172,122 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--streaming-encoding", action="store_true")
     parser.add_argument("--encoder-threads", type=int, default=None)
     parser.add_argument("--bounds-output-json", default="other-files/leader_record_ee_bounds.json")
-    return parser.parse_args()
+    parser.add_argument("--crop-params-dict", default=None)
+    parser.add_argument("--resize-size", default=None)
+
+    if config_args.config_path is not None:
+        parser.set_defaults(**load_config_defaults(config_args.config_path))
+
+    return parser.parse_args(remaining_args)
+
+
+def load_config_defaults(config_path: str) -> dict[str, Any]:
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    env = config.get("env", {})
+    dataset = config.get("dataset", {})
+    processor = env.get("processor", {})
+    robot = env.get("robot", {})
+    teleop = env.get("teleop", {})
+    cameras = robot.get("cameras", {})
+    top_camera = cameras.get("top", {})
+    wrist_camera = cameras.get("wrist", {})
+    inverse_kinematics = processor.get("inverse_kinematics", {})
+    step_sizes = inverse_kinematics.get("end_effector_step_sizes", {})
+    image_preprocessing = processor.get("image_preprocessing", {}) or {}
+
+    defaults = {
+        "repo_id": dataset.get("repo_id"),
+        "task": dataset.get("task"),
+        "root": dataset.get("root"),
+        "num_episodes": dataset.get("num_episodes_to_record"),
+        "fps": env.get("fps"),
+        "robot_port": robot.get("port"),
+        "robot_id": robot.get("id"),
+        "teleop_port": teleop.get("port"),
+        "teleop_id": teleop.get("id"),
+        "urdf_path": inverse_kinematics.get("urdf_path"),
+        "target_frame_name": inverse_kinematics.get("target_frame_name"),
+        "top_camera": top_camera.get("index_or_path"),
+        "wrist_camera": wrist_camera.get("index_or_path"),
+        "camera_width": top_camera.get("width"),
+        "camera_height": top_camera.get("height"),
+        "camera_fps": top_camera.get("fps"),
+        "camera_fourcc": top_camera.get("fourcc"),
+        "camera_backend": top_camera.get("backend"),
+        "x_step_size": step_sizes.get("x"),
+        "y_step_size": step_sizes.get("y"),
+        "z_step_size": step_sizes.get("z"),
+        "crop_params_dict": image_preprocessing.get("crop_params_dict"),
+        "resize_size": image_preprocessing.get("resize_size"),
+        "push_to_hub": dataset.get("push_to_hub"),
+    }
+
+    extra = config.get("leader_hilserl_record", {})
+    defaults.update(
+        {
+            "episode_time_s": extra.get("episode_time_s"),
+            "reset_time_s": extra.get("reset_time_s"),
+            "gripper_deadband": extra.get("gripper_deadband"),
+            "bounds_output_json": extra.get("bounds_output_json"),
+            "display_data": extra.get("display_data"),
+            "vcodec": extra.get("vcodec"),
+            "streaming_encoding": extra.get("streaming_encoding"),
+            "encoder_threads": extra.get("encoder_threads"),
+        }
+    )
+
+    return {k: v for k, v in defaults.items() if v is not None}
+
+
+def parse_json_like(value: Any) -> Any:
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def normalize_crop_params(
+    crop_params_dict: dict[str, list[int] | tuple[int, int, int, int]] | None,
+) -> dict[str, tuple[int, int, int, int]] | None:
+    if not crop_params_dict:
+        return None
+
+    normalized = {}
+    for key, value in crop_params_dict.items():
+        crop = tuple(int(v) for v in value)
+        if len(crop) != 4:
+            raise ValueError(f"Crop params for {key} must have four values: top, left, height, width")
+        normalized[key] = crop
+        for prefix in ("observation.images.", "images."):
+            if key.startswith(prefix):
+                normalized[key.removeprefix(prefix)] = crop
+    return normalized
+
+
+def normalize_resize_size(resize_size: list[int] | tuple[int, int] | None) -> tuple[int, int] | None:
+    if resize_size is None:
+        return None
+    resize = tuple(int(v) for v in resize_size)
+    if len(resize) != 2:
+        raise ValueError("resize_size must have two values: height, width")
+    return resize
+
+
+def make_record_observation_processor(args: argparse.Namespace) -> RobotProcessorPipeline:
+    crop_params_dict = normalize_crop_params(parse_json_like(args.crop_params_dict))
+    resize_size = normalize_resize_size(parse_json_like(args.resize_size))
+    if crop_params_dict is None and resize_size is None:
+        return make_default_processors()[2]
+
+    return RobotProcessorPipeline(
+        steps=[
+            RecordImageCropResizeProcessorStep(
+                crop_params_dict=crop_params_dict,
+                resize_size=resize_size,
+            )
+        ],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
 
 
 def joints_array(joints: dict[str, Any]) -> np.ndarray:
@@ -307,7 +466,8 @@ def main() -> None:
     follower = create_robot(args)
     leader = SO101Leader(SO101LeaderConfig(port=args.teleop_port, id=args.teleop_id))
 
-    teleop_feature_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    teleop_feature_processor, robot_action_processor, _ = make_default_processors()
+    robot_observation_processor = make_record_observation_processor(args)
     kinematics = RobotKinematics(
         urdf_path=args.urdf_path,
         target_frame_name=args.target_frame_name,
