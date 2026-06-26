@@ -541,24 +541,10 @@ def record_leader_hilserl_loop(
 ) -> dict[str, bool]:
     events = empty_record_events()
     start_t = time.perf_counter()
-    last_status_second = -1
-    frame_count = 0
 
     while True:
         loop_start = time.perf_counter()
         elapsed_s = loop_start - start_t
-
-        status_second = int(elapsed_s)
-        if dataset is not None and status_second != last_status_second:
-            if control_time_s is not None:
-                remaining_s = max(control_time_s - elapsed_s, 0.0)
-                print(
-                    f"[recording] remaining={remaining_s:.0f}s frames={frame_count}",
-                    flush=True,
-                )
-            else:
-                print(f"[recording] elapsed={elapsed_s:.0f}s frames={frame_count}", flush=True)
-            last_status_second = status_second
 
         obs = follower.get_observation()
         obs_processed = robot_observation_processor(obs)
@@ -590,7 +576,6 @@ def record_leader_hilserl_loop(
                 "task": task,
             }
             dataset.add_frame(frame)
-            frame_count += 1
 
         if display_data:
             log_rerun_data(observation=obs_processed, action=action_values)
