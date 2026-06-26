@@ -17,7 +17,7 @@
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 import numpy as np
@@ -164,6 +164,148 @@ class AddTeleopEventsAsInfoStep(InfoProcessorStep):
         teleop_events = self.teleop_device.get_teleop_events()
         new_info.update(teleop_events)
         return new_info
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register("leader_joints_to_hil_action")
+class LeaderJointsToHILActionProcessorStep(ProcessorStep):
+    """
+    Mirrors SO leader-arm joints for stable execution and records HIL-SERL 4D actions.
+
+    For demonstrations, the follower should be stable and predictable. This step therefore
+    sends follower joint targets directly from the leader joint displacement, avoiding IK
+    for execution. It separately uses FK on the follower current and target joints to record
+    the normalized EE-space action expected by HIL-SERL.
+    """
+
+    follower_kinematics: Any
+    leader_motor_names: list[str]
+    follower_motor_names: list[str]
+    end_effector_step_sizes: dict[str, float]
+    use_gripper: bool = True
+    max_gripper_pos: float | None = None
+    gripper_deadband: float = 1.0
+    intervention_deadband: float = 1e-3
+    reference_leader_joints: np.ndarray | None = field(default=None, init=False, repr=False)
+    reference_follower_joints: np.ndarray | None = field(default=None, init=False, repr=False)
+    previous_follower_gripper_target: float | None = field(default=None, init=False, repr=False)
+
+    def _joint_values(self, joints: dict[str, Any], motor_names: list[str]) -> np.ndarray:
+        return np.array([float(joints[f"{name}.pos"]) for name in motor_names], dtype=float)
+
+    def _joint_dict(self, joint_values: np.ndarray, motor_names: list[str]) -> dict[str, float]:
+        return {f"{name}.pos": float(joint_values[i]) for i, name in enumerate(motor_names)}
+
+    def _ee_position(self, joints: dict[str, Any]) -> np.ndarray:
+        q = self._joint_values(joints, self.follower_motor_names)
+        return np.asarray(self.follower_kinematics.forward_kinematics(q), dtype=float)[:3, 3]
+
+    def _mirror_follower_action(
+        self, leader_action: dict[str, Any], follower_observation: dict[str, Any]
+    ) -> dict[str, float]:
+        leader_joints = self._joint_values(leader_action, self.leader_motor_names)
+
+        if self.reference_leader_joints is None or self.reference_follower_joints is None:
+            self.reference_leader_joints = leader_joints
+            self.reference_follower_joints = self._joint_values(
+                follower_observation, self.follower_motor_names
+            )
+            follower_targets = self.reference_follower_joints.copy()
+        else:
+            follower_targets = self.reference_follower_joints + (
+                leader_joints - self.reference_leader_joints
+            )
+
+        if self.use_gripper:
+            if self.max_gripper_pos is not None:
+                follower_targets[-1] = np.clip(follower_targets[-1], 0.0, self.max_gripper_pos)
+        else:
+            follower_targets[-1] = self.reference_follower_joints[-1]
+
+        return self._joint_dict(follower_targets, self.follower_motor_names)
+
+    def _gripper_action(self, follower_action: dict[str, Any]) -> float:
+        if not self.use_gripper:
+            return 1.0
+
+        gripper_target = float(follower_action["gripper.pos"])
+        if self.previous_follower_gripper_target is None:
+            self.previous_follower_gripper_target = gripper_target
+            return 1.0
+
+        diff = gripper_target - self.previous_follower_gripper_target
+        self.previous_follower_gripper_target = gripper_target
+        if diff > self.gripper_deadband:
+            return 0.0
+        if diff < -self.gripper_deadband:
+            return 2.0
+        return 1.0
+
+    def _delta_action_tensor(
+        self, transition: EnvTransition, delta: np.ndarray, gripper_action: float
+    ) -> torch.Tensor:
+        values = [float(delta[0]), float(delta[1]), float(delta[2])]
+        if self.use_gripper:
+            values.append(float(gripper_action))
+
+        action = transition.get(TransitionKey.ACTION)
+        dtype = action.dtype if isinstance(action, torch.Tensor) else torch.float32
+        device = action.device if isinstance(action, torch.Tensor) else None
+        return torch.tensor(values, dtype=dtype, device=device)
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        new_transition = dict(transition)
+        complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+        info = dict(new_transition.get(TransitionKey.INFO, {}))
+
+        leader_action = complementary_data.get(TELEOP_ACTION_KEY)
+        follower_observation = new_transition.get(TransitionKey.OBSERVATION)
+        if leader_action is None or follower_observation is None:
+            return new_transition
+        if not isinstance(leader_action, dict):
+            return new_transition
+
+        step_sizes = np.array(
+            [
+                self.end_effector_step_sizes["x"],
+                self.end_effector_step_sizes["y"],
+                self.end_effector_step_sizes["z"],
+            ],
+            dtype=float,
+        )
+        if np.any(step_sizes <= 0):
+            raise ValueError("end_effector_step_sizes must be positive for leader control")
+
+        follower_action = self._mirror_follower_action(leader_action, follower_observation)
+        target_pos = self._ee_position(follower_action)
+        current_pos = self._ee_position(follower_observation)
+        delta = np.clip((target_pos - current_pos) / step_sizes, -1.0, 1.0)
+        gripper_action = self._gripper_action(follower_action)
+
+        complementary_data[TELEOP_ACTION_KEY] = self._delta_action_tensor(
+            new_transition, delta, gripper_action
+        )
+        info[TeleopEvents.IS_INTERVENTION] = bool(
+            np.linalg.norm(delta) > self.intervention_deadband
+            or (self.use_gripper and gripper_action != 1.0)
+        )
+        new_transition[TransitionKey.ACTION] = follower_action
+        new_transition[TransitionKey.REWARD] = 0.0
+        new_transition[TransitionKey.DONE] = False
+        new_transition[TransitionKey.TRUNCATED] = False
+        new_transition[TransitionKey.INFO] = info
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        return new_transition
+
+    def reset(self) -> None:
+        self.reference_leader_joints = None
+        self.reference_follower_joints = None
+        self.previous_follower_gripper_target = None
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

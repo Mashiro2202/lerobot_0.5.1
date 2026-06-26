@@ -1,0 +1,87 @@
+{
+  "mode": "record",
+  "dataset": {
+    "repo_id": "ROItest/leader_hilserl_test",
+    "task": "leader arm HIL-SERL test",
+    "root": null,
+    "num_episodes_to_record": 3,
+    "replay_episode": null,
+    "push_to_hub": false
+  },
+  "env": {
+    "fps": 10,
+    "robot": {
+      "type": "so101_follower",
+      "id": "hil00",
+      "port": "/dev/ttyACM0",
+      "disable_torque_on_disconnect": true,
+      "max_relative_target": null,
+      "use_degrees": true,
+      "cameras": {
+        "top": {
+          "type": "opencv",
+          "index_or_path": "/dev/video0",
+          "height": 720,
+          "width": 1280,
+          "fps": 10,
+          "fourcc": "MJPG",
+          "backend": 200
+        },
+        "wrist": {
+          "type": "opencv",
+          "index_or_path": "/dev/video2",
+          "height": 720,
+          "width": 1280,
+          "fps": 10,
+          "fourcc": "MJPG",
+          "backend": 200
+        }
+      }
+    },
+    "teleop": {
+      "type": "so101_leader",
+      "id": "hil00",
+      "port": "/dev/ttyACM1",
+      "use_degrees": true
+    },
+    "processor": {
+      "control_mode": "leader",
+      "observation": {
+        "add_joint_velocity_to_observation": true,
+        "add_current_to_observation": true,
+        "add_ee_pose_to_observation": false,
+        "display_cameras": true
+      },
+      "image_preprocessing": {
+        "crop_params_dict": {},
+        "resize_size": [128, 128]
+      },
+      "gripper": {
+        "use_gripper": true,
+        "gripper_penalty": 0.0
+      },
+      "reset": {
+        "fixed_reset_joint_positions": null,
+        "reset_time_s": 5.0,
+        "control_time_s": 20.0,
+        "terminate_on_success": true
+      },
+      "inverse_kinematics": {
+        "urdf_path": "/home/ubuntu/lerobot_0.5.1/needed_files/SO-ARM100-main/Simulation/SO101/so101_new_calib.urdf",
+        "target_frame_name": "gripper_frame_link",
+        "end_effector_bounds": {
+          "min": [0.1512, -0.0858, 0.0669],
+          "max": [0.3049, 0.0847, 0.1952]
+        },
+        "end_effector_step_sizes": {
+          "x": 0.01,
+          "y": 0.01,
+          "z": 0.01
+        }
+      },
+      "reward_classifier": null,
+      "max_gripper_pos": 100.0
+    }
+  },
+  "device": "cuda"
+}

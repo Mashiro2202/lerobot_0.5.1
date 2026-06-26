@@ -48,6 +48,7 @@ from .hil_processor import (
     GymHILAdapterProcessorStep,
     ImageCropResizeProcessorStep,
     InterventionActionProcessorStep,
+    LeaderJointsToHILActionProcessorStep,
     RewardClassifierProcessorStep,
     TimeLimitProcessorStep,
 )
@@ -102,6 +103,7 @@ __all__ = [
     "ImageCropResizeProcessorStep",
     "InfoProcessorStep",
     "InterventionActionProcessorStep",
+    "LeaderJointsToHILActionProcessorStep",
     "make_default_processors",
     "make_default_teleop_action_processor",
     "make_default_robot_action_processor",

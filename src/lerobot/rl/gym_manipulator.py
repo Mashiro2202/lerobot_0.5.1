@@ -39,6 +39,7 @@ from lerobot.processor import (
     GymHILAdapterProcessorStep,
     ImageCropResizeProcessorStep,
     InterventionActionProcessorStep,
+    LeaderJointsToHILActionProcessorStep,
     MapDeltaActionToRobotActionStep,
     MapTensorToDeltaActionDictStep,
     Numpy2TorchActionProcessorStep,
@@ -80,6 +81,18 @@ from lerobot.utils.utils import log_say
 from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
 
 logging.basicConfig(level=logging.INFO)
+
+
+def hil_delta_action_features(use_gripper: bool = True) -> dict[str, Any]:
+    names = {"delta_x": 0, "delta_y": 1, "delta_z": 2}
+    if use_gripper:
+        names["gripper"] = 3
+
+    return {
+        "dtype": "float32",
+        "shape": (4 if use_gripper else 3,),
+        "names": names,
+    }
 
 
 @dataclass
@@ -549,22 +562,54 @@ def make_processors(
     env_pipeline_steps.append(AddBatchDimensionProcessorStep())
     env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
+    use_leader_control = cfg.processor.control_mode == "leader"
+    use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
+
     action_pipeline_steps = [
         AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
-        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
-        InterventionActionProcessorStep(
-            use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
-            terminate_on_success=terminate_on_success,
-        ),
     ]
 
+    if use_leader_control:
+        if cfg.processor.inverse_kinematics is None or kinematics_solver is None:
+            raise ValueError("Leader control requires processor.inverse_kinematics to be configured")
+        if cfg.processor.inverse_kinematics.end_effector_step_sizes is None:
+            raise ValueError("Leader control requires inverse_kinematics.end_effector_step_sizes")
+        if teleop_device is None or not hasattr(teleop_device, "bus"):
+            raise ValueError("Leader control requires an SO leader teleoperator")
+
+        action_pipeline_steps.extend(
+            [
+                LeaderJointsToHILActionProcessorStep(
+                    follower_kinematics=kinematics_solver,
+                    leader_motor_names=list(teleop_device.bus.motors.keys()),
+                    follower_motor_names=motor_names,
+                    end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
+                    use_gripper=use_gripper,
+                    max_gripper_pos=cfg.processor.max_gripper_pos,
+                ),
+                RobotActionToPolicyActionProcessorStep(motor_names=motor_names),
+            ]
+        )
+    else:
+        action_pipeline_steps.extend(
+            [
+                AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
+                InterventionActionProcessorStep(
+                    use_gripper=use_gripper,
+                    terminate_on_success=terminate_on_success,
+                ),
+            ]
+        )
+
     # Replace InverseKinematicsProcessor with new kinematic processors
-    if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
+    if (
+        not use_leader_control
+        and cfg.processor.inverse_kinematics is not None
+        and kinematics_solver is not None
+    ):
         # Add EE bounds and safety processor
         inverse_kinematics_steps = [
-            MapTensorToDeltaActionDictStep(
-                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
-            ),
+            MapTensorToDeltaActionDictStep(use_gripper=use_gripper),
             MapDeltaActionToRobotActionStep(),
             EEReferenceAndDelta(
                 kinematics=kinematics_solver,
@@ -689,14 +734,12 @@ def control_loop(
 
     dataset = None
     if cfg.mode == "record":
-        if teleop_device:
+        if cfg.env.processor.control_mode == "leader":
+            action_features = hil_delta_action_features(use_gripper=use_gripper)
+        elif teleop_device:
             action_features = teleop_device.action_features
         else:
-            action_features = {
-                "dtype": "float32",
-                "shape": (4,),
-                "names": ["delta_x", "delta_y", "delta_z", "gripper"],
-            }
+            action_features = hil_delta_action_features(use_gripper=use_gripper)
         features = {
             ACTION: action_features,
             REWARD: {"dtype": "float32", "shape": (1,), "names": None},
