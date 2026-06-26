@@ -136,6 +136,53 @@ class RecordImageCropResizeProcessorStep(ObservationProcessorStep):
         return features
 
 
+@dataclass
+class RecordJointObservationProcessorStep(ObservationProcessorStep):
+    motor_names: list[str]
+    dt: float
+    add_joint_velocity: bool = False
+    add_current: bool = False
+    robot: SO101Follower | None = None
+
+    def __post_init__(self):
+        self.last_joint_positions: np.ndarray | None = None
+
+    def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        new_observation = dict(observation)
+        positions = np.array([float(observation[f"{name}.pos"]) for name in self.motor_names], dtype=float)
+
+        if self.add_joint_velocity:
+            if self.last_joint_positions is None:
+                velocities = np.zeros_like(positions)
+            else:
+                velocities = (positions - self.last_joint_positions) / self.dt
+            self.last_joint_positions = positions.copy()
+            for name, value in zip(self.motor_names, velocities, strict=True):
+                new_observation[f"{name}.vel"] = float(value)
+
+        if self.add_current:
+            if self.robot is None:
+                raise ValueError("Robot is required to add motor current observations")
+            present_current = self.robot.bus.sync_read("Present_Current")
+            for name in self.motor_names:
+                new_observation[f"{name}.current"] = float(present_current[name])
+
+        return new_observation
+
+    def reset(self) -> None:
+        self.last_joint_positions = None
+
+    def transform_features(self, features: dict[PipelineFeatureType, dict]) -> dict[PipelineFeatureType, dict]:
+        observation_features = features[PipelineFeatureType.OBSERVATION]
+        if self.add_joint_velocity:
+            for name in self.motor_names:
+                observation_features[f"{name}.vel"] = float
+        if self.add_current:
+            for name in self.motor_names:
+                observation_features[f"{name}.current"] = float
+        return features
+
+
 def parse_args() -> argparse.Namespace:
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config-path", default=None)
@@ -178,6 +225,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bounds-output-json", default="other-files/leader_record_ee_bounds.json")
     parser.add_argument("--crop-params-dict", default=None)
     parser.add_argument("--resize-size", default=None)
+    parser.add_argument("--add-joint-velocity-to-observation", action="store_true")
+    parser.add_argument("--add-current-to-observation", action="store_true")
 
     if config_args.config_path is not None:
         parser.set_defaults(**load_config_defaults(config_args.config_path))
@@ -198,6 +247,7 @@ def load_config_defaults(config_path: str) -> dict[str, Any]:
     inverse_kinematics = processor.get("inverse_kinematics", {})
     step_sizes = inverse_kinematics.get("end_effector_step_sizes", {})
     image_preprocessing = processor.get("image_preprocessing", {}) or {}
+    observation = processor.get("observation", {}) or {}
 
     defaults = {
         "repo_id": dataset.get("repo_id"),
@@ -223,6 +273,8 @@ def load_config_defaults(config_path: str) -> dict[str, Any]:
         "z_step_size": step_sizes.get("z"),
         "crop_params_dict": image_preprocessing.get("crop_params_dict"),
         "resize_size": image_preprocessing.get("resize_size"),
+        "add_joint_velocity_to_observation": observation.get("add_joint_velocity_to_observation"),
+        "add_current_to_observation": observation.get("add_current_to_observation"),
         "push_to_hub": dataset.get("push_to_hub"),
     }
 
@@ -276,19 +328,35 @@ def normalize_resize_size(resize_size: list[int] | tuple[int, int] | None) -> tu
     return resize
 
 
-def make_record_observation_processor(args: argparse.Namespace) -> RobotProcessorPipeline:
+def make_record_observation_processor(args: argparse.Namespace, robot: SO101Follower) -> RobotProcessorPipeline:
     crop_params_dict = normalize_crop_params(parse_json_like(args.crop_params_dict))
     resize_size = normalize_resize_size(parse_json_like(args.resize_size))
-    if crop_params_dict is None and resize_size is None:
+    add_joint_velocity = bool(args.add_joint_velocity_to_observation)
+    add_current = bool(args.add_current_to_observation)
+    if crop_params_dict is None and resize_size is None and not add_joint_velocity and not add_current:
         return make_default_processors()[2]
 
-    return RobotProcessorPipeline(
-        steps=[
+    steps = []
+    if add_joint_velocity or add_current:
+        steps.append(
+            RecordJointObservationProcessorStep(
+                motor_names=MOTOR_NAMES,
+                dt=1.0 / args.fps,
+                add_joint_velocity=add_joint_velocity,
+                add_current=add_current,
+                robot=robot,
+            )
+        )
+    if crop_params_dict is not None or resize_size is not None:
+        steps.append(
             RecordImageCropResizeProcessorStep(
                 crop_params_dict=crop_params_dict,
                 resize_size=resize_size,
             )
-        ],
+        )
+
+    return RobotProcessorPipeline(
+        steps=steps,
         to_transition=observation_to_transition,
         to_output=transition_to_observation,
     )
@@ -465,13 +533,20 @@ def save_bounds(path: str, bounds: dict[str, dict[str, list[float]]]) -> None:
     print(f"Saved EE bounds to {output_path}")
 
 
+def print_keyboard_controls() -> None:
+    print("Keyboard controls during recording:")
+    print("  Right arrow: finish the current episode/reset segment")
+    print("  Left arrow: rerecord the current episode")
+    print("  Esc: stop recording")
+
+
 def main() -> None:
     args = parse_args()
     follower = create_robot(args)
     leader = SO101Leader(SO101LeaderConfig(port=args.teleop_port, id=args.teleop_id))
 
     teleop_feature_processor, robot_action_processor, _ = make_default_processors()
-    robot_observation_processor = make_record_observation_processor(args)
+    robot_observation_processor = make_record_observation_processor(args, follower)
     kinematics = RobotKinematics(
         urdf_path=args.urdf_path,
         target_frame_name=args.target_frame_name,
@@ -527,12 +602,14 @@ def main() -> None:
         if args.display_data:
             init_rerun(session_name="leader_hilserl_record")
         listener, events = init_keyboard_listener()
+        print_keyboard_controls()
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < args.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}")
                 hil_action_processor.reset()
+                robot_observation_processor.reset()
                 record_loop(
                     robot=follower,
                     events=events,
@@ -552,6 +629,7 @@ def main() -> None:
                 ):
                     log_say("Reset the environment")
                     hil_action_processor.reset()
+                    robot_observation_processor.reset()
                     record_loop(
                         robot=follower,
                         events=events,

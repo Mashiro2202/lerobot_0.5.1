@@ -18,6 +18,12 @@ where `gripper` uses:
 2 = open
 ```
 
+With the reference config, `observation.state` contains 18 values:
+
+```text
+6 joint positions + 6 joint velocities + 6 motor currents
+```
+
 ## Run
 
 Pull the branch and run the config-driven recorder:
@@ -37,6 +43,14 @@ Check whether the displayed gripper state matches the real robot. Press Enter to
 ```
 
 Press `Enter` when the displayed state matches the real robot. Press `T` if close/open is inverted.
+
+During recording, the standard LeRobot keyboard controls are available:
+
+```text
+Right arrow = finish the current episode/reset segment
+Left arrow  = rerecord the current episode
+Esc         = stop recording
+```
 
 ## Configuration
 
@@ -82,6 +96,7 @@ The expected action feature is:
 
 ```text
 action {'dtype': 'float32', 'shape': (4,), 'names': {'delta_x': 0, 'delta_y': 1, 'delta_z': 2, 'gripper': 3}}
+observation.state {'dtype': 'float32', 'shape': (18,), ...}
 ```
 
 Check the gripper action distribution:
@@ -93,7 +108,9 @@ import torch
 
 ds = LeRobotDataset("ROItest/leader_hilserl_record_config_test")
 a = torch.stack([ds[i]["action"] for i in range(len(ds))])
+s = torch.stack([ds[i]["observation.state"] for i in range(len(ds))])
 print("action shape:", a.shape)
+print("state shape:", s.shape)
 print("min:", a.min(dim=0).values.tolist())
 print("max:", a.max(dim=0).values.tolist())
 print("gripper values:", sorted(set(a[:, 3].tolist())))
