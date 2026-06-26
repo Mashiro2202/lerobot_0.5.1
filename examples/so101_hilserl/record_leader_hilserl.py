@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover - POSIX-only interactive helper.
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.configs.types import PipelineFeatureType
-from lerobot.datasets.feature_utils import combine_feature_dicts
+from lerobot.datasets.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.datasets.video_utils import VideoEncodingManager
@@ -50,11 +50,10 @@ from lerobot.model.kinematics import RobotKinematics
 from lerobot.processor import ObservationProcessorStep, RobotProcessorPipeline, make_default_processors
 from lerobot.processor.converters import observation_to_transition, transition_to_observation
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
-from lerobot.scripts.lerobot_record import record_loop
 from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
-from lerobot.utils.control_utils import init_keyboard_listener
+from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
 from lerobot.utils.utils import log_say
-from lerobot.utils.visualization_utils import init_rerun
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
 MOTOR_NAMES = [
@@ -76,6 +75,7 @@ GRIPPER_CONFIRM_PROMPT = (
     'Check whether the displayed gripper state matches the real robot. '
     'Press Enter to continue if it is correct, or press "T" to invert it and check again.'
 )
+DISCRETE_PENALTY_KEY = "complementary_info.discrete_penalty"
 
 
 class KeyReader:
@@ -450,6 +450,35 @@ def print_gripper_status(action: float) -> None:
     print(f"\r{int(action)} {GRIPPER_LABELS[action]}      ", end="", flush=True)
 
 
+def empty_record_events() -> dict[str, bool]:
+    return {
+        "terminate_episode": False,
+        "success": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
+
+
+def update_record_events_from_key(events: dict[str, bool], key: str | None) -> None:
+    if key is None:
+        return
+    key = key.lower()
+    if key == "s":
+        events["terminate_episode"] = True
+        events["success"] = True
+    elif key == "q":
+        events["terminate_episode"] = True
+        events["success"] = False
+    elif key == "r":
+        events["terminate_episode"] = True
+        events["rerecord_episode"] = True
+        events["success"] = False
+    elif key == "\x1b":
+        events["terminate_episode"] = True
+        events["stop_recording"] = True
+        events["success"] = False
+
+
 def confirm_gripper_mapping(
     follower: SO101Follower,
     leader: SO101Leader,
@@ -497,6 +526,83 @@ def confirm_gripper_mapping(
             time.sleep(max(1.0 / fps - (time.perf_counter() - loop_start), 0.0))
 
 
+def record_leader_hilserl_loop(
+    follower: SO101Follower,
+    leader: SO101Leader,
+    key_reader: KeyReader,
+    fps: int,
+    teleop_action_processor: LeaderToHILActionProcessor,
+    robot_action_processor: RobotProcessorPipeline,
+    robot_observation_processor: RobotProcessorPipeline,
+    dataset: LeRobotDataset | None = None,
+    control_time_s: float | None = None,
+    task: str | None = None,
+    display_data: bool = False,
+) -> dict[str, bool]:
+    events = empty_record_events()
+    start_t = time.perf_counter()
+    last_status_second = -1
+    frame_count = 0
+
+    while True:
+        loop_start = time.perf_counter()
+        elapsed_s = loop_start - start_t
+
+        status_second = int(elapsed_s)
+        if dataset is not None and status_second != last_status_second:
+            if control_time_s is not None:
+                remaining_s = max(control_time_s - elapsed_s, 0.0)
+                print(
+                    f"[recording] remaining={remaining_s:.0f}s frames={frame_count}",
+                    flush=True,
+                )
+            else:
+                print(f"[recording] elapsed={elapsed_s:.0f}s frames={frame_count}", flush=True)
+            last_status_second = status_second
+
+        obs = follower.get_observation()
+        obs_processed = robot_observation_processor(obs)
+        observation_frame = (
+            build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+            if dataset is not None
+            else None
+        )
+
+        leader_action = leader.get_action()
+        action_values = teleop_action_processor((leader_action, obs))
+        robot_action_to_send = robot_action_processor((action_values, obs))
+        _ = follower.send_action(robot_action_to_send)
+
+        update_record_events_from_key(events, key_reader.read_key())
+        elapsed_after_step = time.perf_counter() - start_t
+        timed_out_after_step = control_time_s is not None and elapsed_after_step >= control_time_s
+        done = events["terminate_episode"] or timed_out_after_step
+        reward = 1.0 if events["success"] else 0.0
+
+        if dataset is not None and observation_frame is not None:
+            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+            frame = {
+                **observation_frame,
+                **action_frame,
+                REWARD: np.array([reward], dtype=np.float32),
+                DONE: np.array([done], dtype=bool),
+                DISCRETE_PENALTY_KEY: np.array([0.0], dtype=np.float32),
+                "task": task,
+            }
+            dataset.add_frame(frame)
+            frame_count += 1
+
+        if display_data:
+            log_rerun_data(observation=obs_processed, action=action_values)
+
+        if done:
+            break
+
+        time.sleep(max(1.0 / fps - (time.perf_counter() - loop_start), 0.0))
+
+    return events
+
+
 def create_robot(args: argparse.Namespace) -> SO101Follower:
     cameras = {
         "top": OpenCVCameraConfig(
@@ -535,8 +641,9 @@ def save_bounds(path: str, bounds: dict[str, dict[str, list[float]]]) -> None:
 
 def print_keyboard_controls() -> None:
     print("Keyboard controls during recording:")
-    print("  Right arrow: finish the current episode/reset segment")
-    print("  Left arrow: rerecord the current episode")
+    print("  s: save the current episode with reward=1")
+    print("  q: save the current episode with reward=0")
+    print("  r: rerecord the current episode")
     print("  Esc: stop recording")
 
 
@@ -572,6 +679,13 @@ def main() -> None:
             use_videos=True,
         ),
     )
+    dataset_features[REWARD] = {"dtype": "float32", "shape": (1,), "names": None}
+    dataset_features[DONE] = {"dtype": "bool", "shape": (1,), "names": None}
+    dataset_features[DISCRETE_PENALTY_KEY] = {
+        "dtype": "float32",
+        "shape": (1,),
+        "names": ["discrete_penalty"],
+    }
 
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
@@ -587,7 +701,6 @@ def main() -> None:
         encoder_threads=args.encoder_threads,
     )
 
-    listener = None
     try:
         leader.connect()
         follower.connect()
@@ -601,57 +714,57 @@ def main() -> None:
 
         if args.display_data:
             init_rerun(session_name="leader_hilserl_record")
-        listener, events = init_keyboard_listener()
         print_keyboard_controls()
 
-        with VideoEncodingManager(dataset):
-            recorded_episodes = 0
-            while recorded_episodes < args.num_episodes and not events["stop_recording"]:
-                log_say(f"Recording episode {dataset.num_episodes}")
-                hil_action_processor.reset()
-                robot_observation_processor.reset()
-                record_loop(
-                    robot=follower,
-                    events=events,
-                    fps=args.fps,
-                    teleop_action_processor=hil_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    teleop=leader,
-                    dataset=dataset,
-                    control_time_s=args.episode_time_s,
-                    single_task=args.task,
-                    display_data=args.display_data,
-                )
-
-                if not events["stop_recording"] and (
-                    recorded_episodes < args.num_episodes - 1 or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment")
+        with KeyReader() as record_keys:
+            with VideoEncodingManager(dataset):
+                recorded_episodes = 0
+                stop_recording = False
+                while recorded_episodes < args.num_episodes and not stop_recording:
+                    log_say(f"Recording episode {dataset.num_episodes}")
                     hil_action_processor.reset()
                     robot_observation_processor.reset()
-                    record_loop(
-                        robot=follower,
-                        events=events,
+                    events = record_leader_hilserl_loop(
+                        follower=follower,
+                        leader=leader,
+                        key_reader=record_keys,
                         fps=args.fps,
                         teleop_action_processor=hil_action_processor,
                         robot_action_processor=robot_action_processor,
                         robot_observation_processor=robot_observation_processor,
-                        teleop=leader,
-                        control_time_s=args.reset_time_s,
-                        single_task=args.task,
+                        dataset=dataset,
+                        control_time_s=args.episode_time_s,
+                        task=args.task,
                         display_data=args.display_data,
                     )
 
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode")
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    continue
+                    if events["rerecord_episode"]:
+                        log_say("Re-record episode")
+                        dataset.clear_episode_buffer()
+                        continue
 
-                dataset.save_episode()
-                recorded_episodes += 1
+                    dataset.save_episode()
+                    recorded_episodes += 1
+                    stop_recording = events["stop_recording"]
+
+                    if not stop_recording and recorded_episodes < args.num_episodes:
+                        log_say("Reset the environment")
+                        hil_action_processor.reset()
+                        robot_observation_processor.reset()
+                        reset_events = record_leader_hilserl_loop(
+                            follower=follower,
+                            leader=leader,
+                            key_reader=record_keys,
+                            fps=args.fps,
+                            teleop_action_processor=hil_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            dataset=None,
+                            control_time_s=args.reset_time_s,
+                            task=args.task,
+                            display_data=args.display_data,
+                        )
+                        stop_recording = reset_events["stop_recording"]
     finally:
         log_say("Stop recording", blocking=True)
         save_bounds(args.bounds_output_json, hil_action_processor.bounds())
@@ -660,8 +773,6 @@ def main() -> None:
             follower.disconnect()
         if leader.is_connected:
             leader.disconnect()
-        if listener is not None:
-            listener.stop()
         if args.push_to_hub:
             dataset.push_to_hub(private=args.private)
 

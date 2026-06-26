@@ -47,9 +47,10 @@ Press `Enter` when the displayed state matches the real robot. Press `T` if clos
 During recording, the standard LeRobot keyboard controls are available:
 
 ```text
-Right arrow = finish the current episode/reset segment
-Left arrow  = rerecord the current episode
-Esc         = stop recording
+s   = save the current episode with reward=1
+q   = save the current episode with reward=0
+r   = rerecord the current episode
+Esc = stop recording
 ```
 
 ## Configuration
@@ -97,6 +98,9 @@ The expected action feature is:
 ```text
 action {'dtype': 'float32', 'shape': (4,), 'names': {'delta_x': 0, 'delta_y': 1, 'delta_z': 2, 'gripper': 3}}
 observation.state {'dtype': 'float32', 'shape': (18,), ...}
+next.reward {'dtype': 'float32', 'shape': (1,), 'names': None}
+next.done {'dtype': 'bool', 'shape': (1,), 'names': None}
+complementary_info.discrete_penalty {'dtype': 'float32', 'shape': (1,), 'names': ['discrete_penalty']}
 ```
 
 Check the gripper action distribution:
@@ -115,6 +119,8 @@ print("min:", a.min(dim=0).values.tolist())
 print("max:", a.max(dim=0).values.tolist())
 print("gripper values:", sorted(set(a[:, 3].tolist())))
 print("saturated xyz counts:", ((a[:, :3].abs() >= 0.999).sum(dim=0)).tolist())
+print("reward values:", sorted(set(ds[i]["next.reward"].item() for i in range(len(ds)))))
+print("done count:", sum(bool(ds[i]["next.done"].item()) for i in range(len(ds))))
 PY
 ```
 
