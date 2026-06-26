@@ -72,6 +72,10 @@ HIL_ACTION_FEATURES = {
     "gripper": float,
 }
 GRIPPER_LABELS = {0.0: "close", 1.0: "stay", 2.0: "open"}
+GRIPPER_CONFIRM_PROMPT = (
+    'Check whether the displayed gripper state matches the real robot. '
+    'Press Enter to continue if it is correct, or press "T" to invert it and check again.'
+)
 
 
 class KeyReader:
@@ -387,7 +391,7 @@ def confirm_gripper_mapping(
     positive_gripper_action = "close"
     previous_gripper_target: float | None = None
 
-    print("请注意以下显示的状态是否正确，如果正确按 Enter 下一步，如果相反请按\"T\"转换后再次确认")
+    print(GRIPPER_CONFIRM_PROMPT)
     print_gripper_status(1.0)
 
     with KeyReader() as keys:
@@ -420,7 +424,7 @@ def confirm_gripper_mapping(
                 positive_gripper_action = "open" if positive_gripper_action == "close" else "close"
                 previous_gripper_target = None
                 print()
-                print("请注意以下显示的状态是否正确，如果正确按 Enter 下一步，如果相反请按\"T\"转换后再次确认")
+                print(GRIPPER_CONFIRM_PROMPT)
 
             time.sleep(max(1.0 / fps - (time.perf_counter() - loop_start), 0.0))
 
