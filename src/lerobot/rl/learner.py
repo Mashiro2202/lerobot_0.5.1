@@ -1116,6 +1116,14 @@ def process_interaction_message(
     # Shift interaction step for consistency with checkpointed state
     message["Interaction step"] += interaction_step_shift
 
+    logging.info(
+        "[LEARNER_INTERACTION] step=%s episodic_reward=%s episode_intervention=%s "
+        "intervention_rate=%s",
+        message.get("Interaction step"),
+        message.get("Episodic reward"),
+        message.get("Episode intervention"),
+        message.get("Intervention rate"),
+    )
     # Log if logger available
     if wandb_logger:
         wandb_logger.log_dict(d=message, mode="train", custom_step_key="Interaction step")
@@ -1159,11 +1167,34 @@ def process_transitions(
 
             replay_buffer.add(**transition)
 
+
+            is_intervention = bool(
+                transition.get("complementary_info", {}).get(TeleopEvents.IS_INTERVENTION.value, False)
+            )
             # Add to offline buffer if it's an intervention
-            if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
-                TeleopEvents.IS_INTERVENTION.value
-            ):
+            if dataset_repo_id is not None and is_intervention:
                 offline_replay_buffer.add(**transition)
+
+            transition_count = getattr(process_transitions, "_debug_transition_count", 0) + 1
+            intervention_count = getattr(process_transitions, "_debug_intervention_count", 0)
+            if is_intervention:
+                intervention_count += 1
+            setattr(process_transitions, "_debug_transition_count", transition_count)
+            setattr(process_transitions, "_debug_intervention_count", intervention_count)
+
+            if transition_count == 1 or transition_count % 500 == 0:
+                intervention_rate = intervention_count / transition_count
+                logging.info(
+                    "[LEARNER_TRANSITION_CHECK] count=%s last_intervention=%s "
+                    "intervention_count=%s intervention_rate=%.4f replay_buffer_size=%s "
+                    "offline_replay_buffer_size=%s",
+                    transition_count,
+                    is_intervention,
+                    intervention_count,
+                    intervention_rate,
+                    len(replay_buffer),
+                    len(offline_replay_buffer),
+                )
 
 
 def process_interaction_messages(

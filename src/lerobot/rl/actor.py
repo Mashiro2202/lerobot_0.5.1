@@ -370,6 +370,17 @@ def act_with_policy(
             if episode_total_steps > 0:
                 intervention_rate = episode_intervention_steps / episode_total_steps
 
+            logging.info(
+                "[EP_SUMMARY] step=%s reward=%.4f intervention=%s intervention_steps=%s "
+                "total_steps=%s intervention_rate=%.4f",
+                interaction_step,
+                sum_reward_episode,
+                int(episode_intervention),
+                episode_intervention_steps,
+                episode_total_steps,
+                intervention_rate,
+            )
+
             # Send episodic reward to the learner
             interactions_queue.put(
                 python_object_to_bytes(
